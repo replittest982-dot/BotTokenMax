@@ -1,0 +1,16 @@
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+
+WORKDIR /app
+
+# Копируем зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Устанавливаем только Chromium (чтобы не тянуть лишнее)
+RUN playwright install chromium --with-deps
+
+# Копируем код
+COPY . .
+
+# Запуск
+CMD ["python", "main.py"]
