@@ -2,15 +2,21 @@ FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
 WORKDIR /app
 
-# Копируем зависимости
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Системные зависимости
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем только Chromium (чтобы не тянуть лишнее)
-RUN playwright install chromium --with-deps
+# Устанавливаем зависимости Python
+RUN pip install --no-cache-dir \
+    aiogram==3.4.1 \
+    playwright==1.40.0
+
+# Браузеры уже в образе, но на всякий случай переустанавливаем Chromium
+RUN playwright install chromium
 
 # Копируем код
-COPY . .
+COPY main.py .
 
 # Запуск
 CMD ["python", "main.py"]
