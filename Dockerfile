@@ -1,23 +1,21 @@
-
-# 1. Используем официальный образ Playwright
+# Используем образ со всеми системными зависимостями
 FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
-# 2. Устанавливаем рабочую директорию
+# Устанавливаем рабочую папку
 WORKDIR /app
 
-# 3. Указываем переменную окружения, чтобы Playwright ставил браузеры в /app/pw-browsers
-# Это исключит ошибки доступа к папке /root
+# Указываем, куда скачивать браузер (важно для прав доступа на хостинге)
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
 
-# 4. Копируем requirements и ставим либы
+# Сначала копируем зависимости и ставим их
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Устанавливаем ТОЛЬКО chromium (чтобы не раздувать образ)
+# Скачиваем только Chromium (чтобы образ не весил 2ГБ)
 RUN playwright install chromium
 
-# 6. Копируем остальной код
+# Копируем весь остальной код бота
 COPY . .
 
-# 7. Запуск
+# Запуск
 CMD ["python", "main.py"]
