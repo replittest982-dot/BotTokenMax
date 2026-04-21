@@ -2,10 +2,9 @@ FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
 WORKDIR /app
 
-# Ставим ТОЛЬКО aiogram, playwright НЕ трогаем — он уже есть в образе
 RUN pip install --no-cache-dir aiogram==3.4.1
+RUN playwright install chromium --with-deps
 
-# Копируем код
 COPY main.py .
 
 CMD ["python", "main.py"]
