@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-# Указываем путь к браузерам для Playwright (согласно настройкам в Dockerfile)
+# Принудительно задаем путь к браузерам
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/app/pw-browsers"
 
 from aiogram import Bot, Dispatcher, types, F
@@ -22,7 +22,6 @@ from aiogram.types import (
 from playwright.async_api import async_playwright
 
 # ─── Настройка логирования ───────────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -30,20 +29,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("MAX-Bot")
 
-# ─── Конфигурация ────────────────────────────────────────────────────────────
-
 TOKEN = os.getenv("BOT_TOKEN", "")
-if not TOKEN:
-    raise RuntimeError("❌ Переменная окружения BOT_TOKEN не задана!")
-
 QR_TIMEOUT    = 20_000
 LOGIN_TIMEOUT = 90_000
 MAX_URL       = "https://web.max.ru"
 
 class LoginFlow(StatesGroup):
     waiting_for_qr_scan = State()
-
-# ─── JavaScript Скрипты ──────────────────────────────────────────────────────
 
 JS_EXTRACTOR = """
 () => {
@@ -61,8 +53,6 @@ JS_QR_BASE64 = """
 }
 """
 
-# ─── Клавиатуры ──────────────────────────────────────────────────────────────
-
 def kb_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_login")]
@@ -74,8 +64,6 @@ def kb_after_session() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="ℹ️ Помощь",       callback_data="help")]
     ])
 
-# ─── Основная логика захвата сессии ──────────────────────────────────────────
-
 async def grab_session(message: types.Message, state: FSMContext):
     user_id  = message.from_user.id
     username = message.from_user.username or str(user_id)
@@ -83,11 +71,12 @@ async def grab_session(message: types.Message, state: FSMContext):
 
     await message.answer(
         "🚀 <b>Запускаю браузер…</b>\n"
-        "Через несколько секунд пришлю QR-код для входа в MAX.",
+        "Через несколько секунд пришлю QR-код.",
         parse_mode="HTML",
         reply_markup=kb_cancel()
     )
 
+    browser = None
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
@@ -96,193 +85,83 @@ async def grab_session(message: types.Message, state: FSMContext):
             )
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
-
             await page.goto(MAX_URL, wait_until="domcontentloaded")
 
-            # Ожидание QR-кода
             try:
                 await page.wait_for_selector("canvas", timeout=QR_TIMEOUT)
             except Exception:
-                await message.answer(
-                    "❌ QR-код не появился. Попробуй <code>/login</code> ещё раз.",
-                    parse_mode="HTML"
-                )
-                await browser.close()
+                await message.answer("❌ QR-код не появился. Попробуй ещё раз.")
                 return
 
-            # Извлечение QR
             qr_b64 = await page.evaluate(JS_QR_BASE64)
-            if qr_b64:
-                img_bytes = base64.b64decode(qr_b64)
-            else:
-                img_bytes = await page.screenshot(full_page=False)
+            img_bytes = base64.b64decode(qr_b64) if qr_b64 else await page.screenshot()
 
             await state.set_state(LoginFlow.waiting_for_qr_scan)
             await state.update_data(ts=time.time())
 
             await message.answer_photo(
                 photo=BufferedInputFile(img_bytes, filename="qr.png"),
-                caption=(
-                    "📱 <b>Отсканируй QR в приложении MAX</b>\n\n"
-                    f"⏳ У тебя есть <b>{LOGIN_TIMEOUT // 1000} секунд</b>.\n"
-                    "После входа бот автоматически заберёт сессию."
-                ),
+                caption=f"📱 <b>Отсканируй QR</b>\n⏳ У тебя есть {LOGIN_TIMEOUT // 1000} сек.",
                 parse_mode="HTML",
                 reply_markup=kb_cancel()
             )
-            log.info(f"[{username}] QR sent, waiting for auth…")
 
-            # Ожидание перехода после сканирования
             try:
                 await page.wait_for_url("**/messenger**", timeout=LOGIN_TIMEOUT)
             except Exception:
                 await state.clear()
-                await message.answer(
-                    "⏰ <b>Время вышло.</b> Ты не успел войти.\n"
-                    "Запусти <code>/login</code> заново.",
-                    parse_mode="HTML"
-                )
-                await browser.close()
+                await message.answer("⏰ Время вышло.")
                 return
 
             await asyncio.sleep(2)
-
-            # Извлечение данных сессии
-            data      = await page.evaluate(JS_EXTRACTOR)
-            auth_raw  = data.get("auth")
-            device_id = data.get("device")
-
-            if not auth_raw or not device_id:
-                await message.answer(
-                    "⚠️ Вход выполнен, но данные сессии не найдены.\n"
-                    "Попробуй <code>/login</code> ещё раз.",
-                    parse_mode="HTML"
-                )
-                await browser.close()
+            data = await page.evaluate(JS_EXTRACTOR)
+            
+            if not data.get("auth") or not data.get("device"):
+                await message.answer("⚠️ Данные не найдены.")
                 return
 
-            try:
-                auth_obj = json.loads(auth_raw)
-            except json.JSONDecodeError:
-                await message.answer("❌ Не удалось распарсить данные сессии.")
-                await browser.close()
-                return
-
-            token    = auth_obj.get("token", "")
-            is_valid = token.startswith("An")
-
-            # Формирование JS-скрипта для переноса
             transfer_script = (
-                "sessionStorage.clear();\n"
-                "localStorage.clear();\n"
-                f"localStorage.setItem('__oneme_device_id', {json.dumps(device_id)});\n"
-                f"localStorage.setItem('__oneme_auth', {json.dumps(auth_raw)});\n"
+                f"localStorage.setItem('__oneme_device_id', {json.dumps(data['device'])});\n"
+                f"localStorage.setItem('__oneme_auth', {json.dumps(data['auth'])});\n"
                 "window.location.reload();"
-            )
-
-            doc = BufferedInputFile(
-                transfer_script.encode("utf-8"),
-                filename=f"session_{user_id}.txt"
-            )
-
-            status_icon = "✅" if is_valid else "⚠️"
-            status_text = (
-                "Токен валиден (начинается на <code>An</code>)"
-                if is_valid else
-                "Токен не начинается на <code>An</code> — проверь данные"
             )
 
             await state.clear()
             await message.answer_document(
-                document=doc,
-                caption=(
-                    f"{status_icon} <b>{status_text}</b>\n\n"
-                    "📄 В файле — скрипт для вставки в консоль (<code>F12 → Console</code>).\n"
-                    "Он перенесёт сессию в любой браузер."
-                ),
-                parse_mode="HTML",
+                document=BufferedInputFile(transfer_script.encode(), filename=f"session_{user_id}.txt"),
+                caption="✅ Сессия получена!",
                 reply_markup=kb_after_session()
             )
-            log.info(f"[{username}] Session grabbed. Token valid: {is_valid}")
-
-            await browser.close()
 
         except Exception as e:
-            log.exception(f"[{username}] Unexpected error: {e}")
-            await state.clear()
-            await message.answer(
-                f"💥 <b>Неожиданная ошибка:</b>\n<code>{e}</code>",
-                parse_mode="HTML"
-            )
+            log.exception("Grab error")
+            # ГЛАВНОЕ: Экранируем ошибку для Telegram
+            safe_err = str(e).replace("<", "&lt;").replace(">", "&gt;")
+            await message.answer(f"💥 <b>Ошибка:</b>\n<code>{safe_err}</code>", parse_mode="HTML")
+        finally:
+            if browser:
+                await browser.close()
 
-# ─── Хендлеры Bot ────────────────────────────────────────────────────────────
+# ─── Стандартные хендлеры ───────────────────────────────────────────────────
 
 bot = Bot(token=TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 <b>MAX Session Grabber</b>\n\n"
-        "Команды:\n"
-        "• /login — получить сессию через QR\n"
-        "• /help — помощь\n",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "ℹ️ <b>Как пользоваться:</b>\n\n"
-        "1. Отправь <code>/login</code>\n"
-        "2. Отсканируй QR в приложении MAX\n"
-        "3. Получи файл <code>session_*.txt</code>\n"
-        "4. Открой нужный сайт MAX в браузере\n"
-        "5. Нажми <b>F12 → Console</b>, вставь содержимое и нажми Enter\n\n"
-        "⚠️ Не передавай файл сессии посторонним!",
-        parse_mode="HTML"
-    )
+async def cmd_start(m: types.Message):
+    await m.answer("Напиши /login для входа.")
 
 @dp.message(Command("login"))
-async def cmd_login(message: types.Message, state: FSMContext):
-    current = await state.get_state()
-    if current == LoginFlow.waiting_for_qr_scan:
-        data    = await state.get_data()
-        elapsed = int(time.time() - data.get("ts", 0))
-        await message.answer(
-            f"⏳ Уже идёт процесс входа ({elapsed}с назад). "
-            "Дождись QR или нажми «Отмена».",
-            reply_markup=kb_cancel()
-        )
-        return
-    await grab_session(message, state)
+async def cmd_login(m: types.Message, state: FSMContext):
+    await grab_session(m, state)
 
 @dp.callback_query(F.data == "cancel_login")
-async def cb_cancel(callback: CallbackQuery, state: FSMContext):
+async def cb_cancel(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("❌ Отменено.")
-    await callback.answer()
-
-@dp.callback_query(F.data == "new_session")
-async def cb_new_session(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await grab_session(callback.message, state)
-
-@dp.callback_query(F.data == "help")
-async def cb_help(callback: CallbackQuery):
-    await callback.answer()
-    await cmd_help(callback.message)
-
-# ─── Запуск ──────────────────────────────────────────────────────────────────
+    await c.message.answer("❌ Отменено.")
 
 if __name__ == "__main__":
-    log.info("Bot starting...")
-    asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
+    asyncio.run(dp.start_polling(bot))
