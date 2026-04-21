@@ -2,8 +2,15 @@ import os
 import asyncio
 import logging
 import time
+import base64
+import json
+from dotenv import load_dotenv
 
-# Указываем путь к браузерам (если используешь Docker)
+# Загружаем переменные из .env
+load_dotenv()
+
+# Если ты на Aeza и ставил через playwright install --with-deps, 
+# строку ниже можно закомментировать. Если по моему тутору с путями — оставляй.
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/app/pw-browsers"
 
 from aiogram import Bot, Dispatcher, types, F
@@ -19,14 +26,12 @@ log = logging.getLogger("MAX-Bot")
 
 TOKEN = os.getenv("BOT_TOKEN", "")
 if not TOKEN:
-    raise RuntimeError("❌ Переменная окружения BOT_TOKEN не задана!")
+    raise RuntimeError("❌ Переменная окружения BOT_TOKEN не задана в .env!")
 
 MAX_URL = "https://web.max.ru"
 
-# ─── Глобальные переменные для передачи 2FA между хендлерами ─────────────────
-# Словарь для блокировки потока Playwright, пока ждем код от юзера
+# ─── Глобальные переменные для передачи 2FA ──────────────────────────────────
 user_events = {}
-# Словарь для хранения самого кода/пароля
 user_passwords = {}
 
 class LoginFlow(StatesGroup):
@@ -42,9 +47,9 @@ def kb_cancel() -> InlineKeyboardMarkup:
 
 async def grab_session(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    
     await message.answer("🚀 <b>Запускаю браузер...</b>", parse_mode="HTML")
 
+    browser = None  # Важно: инициализируем до блока try
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
@@ -67,7 +72,6 @@ async def grab_session(message: types.Message, state: FSMContext):
 
             qr_b64 = await page.evaluate("() => { const c = document.querySelector('canvas'); return c ? c.toDataURL('image/png').split(',')[1] : null; }")
             
-            import base64
             img_bytes = base64.b64decode(qr_b64) if qr_b64 else await page.screenshot()
 
             await state.set_state(LoginFlow.waiting_for_qr_scan)
@@ -82,40 +86,35 @@ async def grab_session(message: types.Message, state: FSMContext):
             start_time = time.time()
             auth_success = False
 
-            while time.time() - start_time < 90: # Ждем 90 секунд
-                current_url = page.url
-                
-                # Успешный вход
-                if "messenger" in current_url:
+            while time.time() - start_time < 90:
+                if "/messenger" in page.url:
                     auth_success = True
                     break
                 
-                # === ЛОГИКА 2FA / ПАРОЛЯ ===
-                # ВНИМАНИЕ: Замени "input[type='password']" на реальный селектор инпута пароля/2FA на сайте MAX
+                # Проверка на наличие поля пароля
                 password_input = page.locator("input[type='password']")
                 if await password_input.is_visible():
                     await message.answer("🔒 <b>Сайт запросил пароль или 2FA код!</b>\nОтправь его прямо сюда в чат:", parse_mode="HTML")
                     await state.set_state(LoginFlow.waiting_for_2fa)
                     
-                    # Создаем событие и ждем, пока другой хендлер его не разблокирует
                     user_events[user_id] = asyncio.Event()
-                    await user_events[user_id].wait() # Скрипт ПАУЗИТСЯ здесь
+                    await user_events[user_id].wait() 
                     
-                    # Получаем введенный юзером пароль
                     pwd = user_passwords.get(user_id, "")
-                    
-                    # Вводим пароль на сайте
                     await password_input.fill(pwd)
                     
-                    # Жмем кнопку "Далее/Войти". Замени "button[type='submit']" на реальный селектор
-                    await page.locator("button[type='submit']").click()
+                    # Попытка нажать на кнопку входа (замени селектор если нужно)
+                    submit_btn = page.locator("button[type='submit']")
+                    if await submit_btn.is_visible():
+                        await submit_btn.click()
+                    else:
+                        await page.keyboard.press("Enter")
                     
-                    # Очищаем временные данные
                     user_events.pop(user_id, None)
                     user_passwords.pop(user_id, None)
                     
                     await message.answer("Проверяю код...")
-                    await asyncio.sleep(3) # Даем сайту прогрузиться после ввода 2fa
+                    await asyncio.sleep(5)
                 
                 await asyncio.sleep(1)
 
@@ -124,7 +123,7 @@ async def grab_session(message: types.Message, state: FSMContext):
                 await message.answer("⏰ Время вышло или не удалось войти.")
                 return
 
-            await asyncio.sleep(2) # Пауза, чтобы localStorage точно заполнился
+            await asyncio.sleep(2)
 
             # 3. Извлекаем данные
             data = await page.evaluate("""
@@ -140,8 +139,7 @@ async def grab_session(message: types.Message, state: FSMContext):
                 await message.answer("⚠️ Вход выполнен, но данные в localStorage не найдены.")
                 return
 
-            # 4. Формируем ИДЕАЛЬНЫЙ скрипт, как ты просил
-            # Обрати внимание: data['auth'] уже строка JSON, мы просто оборачиваем ее в одинарные кавычки '{}'
+            # 4. Формируем твой скрипт
             device_str = data['device']
             auth_str = data['auth']
 
@@ -156,21 +154,22 @@ async def grab_session(message: types.Message, state: FSMContext):
             await state.clear()
             await message.answer_document(
                 document=BufferedInputFile(transfer_script.encode('utf-8'), filename=f"session_{user_id}.txt"),
-                caption="✅ <b>Сессия успешно сохранена!</b>\n\nСкопируй содержимое файла в консоль (F12) нужного браузера.",
+                caption="✅ <b>Сессия успешно сохранена!</b>\n\nСкопируй содержимое файла в консоль (F12).",
                 parse_mode="HTML"
             )
 
         except Exception as e:
+            log.exception("Ошибка в grab_session")
             safe_err = str(e).replace("<", "&lt;").replace(">", "&gt;")
             await message.answer(f"💥 <b>Ошибка:</b>\n<code>{safe_err}</code>", parse_mode="HTML")
         finally:
-            await browser.close()
-
+            if browser:
+                await browser.close()
 
 # ─── Хендлеры ────────────────────────────────────────────────────────────────
 
 bot = Bot(token=TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(Command("start", "login"))
 async def cmd_login(message: types.Message, state: FSMContext):
@@ -179,23 +178,16 @@ async def cmd_login(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "cancel_login")
 async def cb_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    user_events.pop(callback.from_user.id, None) # Убиваем ожидание 2FA, если была отмена
+    user_events.pop(callback.from_user.id, None)
     await callback.message.answer("❌ Отменено.")
     await callback.answer()
 
-# Хендлер для перехвата пароля/2FA от юзера
 @dp.message(LoginFlow.waiting_for_2fa)
 async def process_2fa(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    
-    # Сохраняем пароль
     user_passwords[user_id] = message.text
-    
-    # "Дергаем" событие, чтобы Playwright продолжил работу
     if user_id in user_events:
         user_events[user_id].set()
-    
-    # Убираем стейт, чтобы бот не думал, что мы всё еще ждем пароль
     await state.set_state(LoginFlow.waiting_for_qr_scan)
 
 if __name__ == "__main__":
