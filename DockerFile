@@ -3,7 +3,13 @@ FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 WORKDIR /app
 
 RUN pip install --no-cache-dir aiogram==3.4.1
-RUN playwright install chromium --with-deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-unifont \
+    fonts-ubuntu \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m playwright install chromium
 
 COPY main.py .
 
