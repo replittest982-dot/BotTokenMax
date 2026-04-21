@@ -5,6 +5,9 @@ import json
 import logging
 import time
 
+# Указываем путь к браузерам для Playwright (согласно настройкам в Dockerfile)
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/app/pw-browsers"
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -18,7 +21,7 @@ from aiogram.types import (
 )
 from playwright.async_api import async_playwright
 
-# ─── Настройка логирования и бота ────────────────────────────────────────────
+# ─── Настройка логирования ───────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +29,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("MAX-Bot")
+
+# ─── Конфигурация ────────────────────────────────────────────────────────────
 
 TOKEN = os.getenv("BOT_TOKEN", "")
 if not TOKEN:
@@ -37,6 +42,8 @@ MAX_URL       = "https://web.max.ru"
 
 class LoginFlow(StatesGroup):
     waiting_for_qr_scan = State()
+
+# ─── JavaScript Скрипты ──────────────────────────────────────────────────────
 
 JS_EXTRACTOR = """
 () => {
@@ -54,6 +61,8 @@ JS_QR_BASE64 = """
 }
 """
 
+# ─── Клавиатуры ──────────────────────────────────────────────────────────────
+
 def kb_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_login")]
@@ -64,6 +73,8 @@ def kb_after_session() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔄 Новая сессия", callback_data="new_session")],
         [InlineKeyboardButton(text="ℹ️ Помощь",       callback_data="help")]
     ])
+
+# ─── Основная логика захвата сессии ──────────────────────────────────────────
 
 async def grab_session(message: types.Message, state: FSMContext):
     user_id  = message.from_user.id
@@ -78,23 +89,24 @@ async def grab_session(message: types.Message, state: FSMContext):
     )
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        )
-        page = await context.new_page()
-
         try:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            )
+            page = await context.new_page()
+
             await page.goto(MAX_URL, wait_until="domcontentloaded")
 
+            # Ожидание QR-кода
             try:
                 await page.wait_for_selector("canvas", timeout=QR_TIMEOUT)
             except Exception:
@@ -102,8 +114,10 @@ async def grab_session(message: types.Message, state: FSMContext):
                     "❌ QR-код не появился. Попробуй <code>/login</code> ещё раз.",
                     parse_mode="HTML"
                 )
+                await browser.close()
                 return
 
+            # Извлечение QR
             qr_b64 = await page.evaluate(JS_QR_BASE64)
             if qr_b64:
                 img_bytes = base64.b64decode(qr_b64)
@@ -125,6 +139,7 @@ async def grab_session(message: types.Message, state: FSMContext):
             )
             log.info(f"[{username}] QR sent, waiting for auth…")
 
+            # Ожидание перехода после сканирования
             try:
                 await page.wait_for_url("**/messenger**", timeout=LOGIN_TIMEOUT)
             except Exception:
@@ -134,10 +149,12 @@ async def grab_session(message: types.Message, state: FSMContext):
                     "Запусти <code>/login</code> заново.",
                     parse_mode="HTML"
                 )
+                await browser.close()
                 return
 
             await asyncio.sleep(2)
 
+            # Извлечение данных сессии
             data      = await page.evaluate(JS_EXTRACTOR)
             auth_raw  = data.get("auth")
             device_id = data.get("device")
@@ -148,17 +165,20 @@ async def grab_session(message: types.Message, state: FSMContext):
                     "Попробуй <code>/login</code> ещё раз.",
                     parse_mode="HTML"
                 )
+                await browser.close()
                 return
 
             try:
                 auth_obj = json.loads(auth_raw)
             except json.JSONDecodeError:
                 await message.answer("❌ Не удалось распарсить данные сессии.")
+                await browser.close()
                 return
 
             token    = auth_obj.get("token", "")
             is_valid = token.startswith("An")
 
+            # Формирование JS-скрипта для переноса
             transfer_script = (
                 "sessionStorage.clear();\n"
                 "localStorage.clear();\n"
@@ -192,6 +212,8 @@ async def grab_session(message: types.Message, state: FSMContext):
             )
             log.info(f"[{username}] Session grabbed. Token valid: {is_valid}")
 
+            await browser.close()
+
         except Exception as e:
             log.exception(f"[{username}] Unexpected error: {e}")
             await state.clear()
@@ -199,8 +221,8 @@ async def grab_session(message: types.Message, state: FSMContext):
                 f"💥 <b>Неожиданная ошибка:</b>\n<code>{e}</code>",
                 parse_mode="HTML"
             )
-        finally:
-            await browser.close()
+
+# ─── Хендлеры Bot ────────────────────────────────────────────────────────────
 
 bot = Bot(token=TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
@@ -259,6 +281,8 @@ async def cb_help(callback: CallbackQuery):
     await callback.answer()
     await cmd_help(callback.message)
 
+# ─── Запуск ──────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    log.info("Bot starting…")
+    log.info("Bot starting...")
     asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
