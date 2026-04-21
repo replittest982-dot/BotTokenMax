@@ -1,6 +1,4 @@
 import os
-import subprocess
-import sys
 import asyncio
 import base64
 import json
@@ -19,24 +17,6 @@ from aiogram.types import (
     CallbackQuery,
 )
 from playwright.async_api import async_playwright
-
-# ─── Авто-установка браузера ─────────────────────────────────────────────────
-
-def ensure_browser():
-    chrome_path = os.path.expanduser(
-        "~/.cache/ms-playwright/chromium-1091/chrome-linux/chrome"
-    )
-    if not os.path.exists(chrome_path):
-        print("🔧 Браузер не найден, устанавливаю Chromium…", flush=True)
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-            check=True
-        )
-        print("✅ Chromium установлен", flush=True)
-    else:
-        print("✅ Chromium найден", flush=True)
-
-ensure_browser()
 
 # ─── Настройка логирования и бота ────────────────────────────────────────────
 
