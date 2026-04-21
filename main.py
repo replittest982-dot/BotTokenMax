@@ -1,9 +1,11 @@
+import os
+import subprocess
+import sys
 import asyncio
+import base64
 import json
 import logging
-import os
 import time
-from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -18,7 +20,26 @@ from aiogram.types import (
 )
 from playwright.async_api import async_playwright
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# ─── Авто-установка браузера ─────────────────────────────────────────────────
+
+def ensure_browser():
+    chrome_path = os.path.expanduser(
+        "~/.cache/ms-playwright/chromium-1091/chrome-linux/chrome"
+    )
+    if not os.path.exists(chrome_path):
+        print("🔧 Браузер не найден, устанавливаю Chromium…", flush=True)
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+            check=True
+        )
+        print("✅ Chromium установлен", flush=True)
+    else:
+        print("✅ Chromium найден", flush=True)
+
+ensure_browser()
+
+# ─── Настройка логирования и бота ────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -26,22 +47,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("MAX-Bot")
 
-# ─── Config ──────────────────────────────────────────────────────────────────
 TOKEN = os.getenv("BOT_TOKEN", "")
 if not TOKEN:
     raise RuntimeError("❌ Переменная окружения BOT_TOKEN не задана!")
 
-QR_TIMEOUT = 20_000   # мс — ждём появления QR
-LOGIN_TIMEOUT = 90_000  # мс — ждём авторизации
+QR_TIMEOUT    = 20_000
+LOGIN_TIMEOUT = 90_000
+MAX_URL       = "https://web.max.ru"
 
-MAX_URL = "https://web.max.ru"
-
-# ─── FSM ─────────────────────────────────────────────────────────────────────
 class LoginFlow(StatesGroup):
     waiting_for_qr_scan = State()
 
-
-# ─── JS ──────────────────────────────────────────────────────────────────────
 JS_EXTRACTOR = """
 () => {
     const auth   = localStorage.getItem('__oneme_auth');
@@ -58,7 +74,6 @@ JS_QR_BASE64 = """
 }
 """
 
-# ─── Keyboards ───────────────────────────────────────────────────────────────
 def kb_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_login")]
@@ -67,10 +82,9 @@ def kb_cancel() -> InlineKeyboardMarkup:
 def kb_after_session() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Новая сессия", callback_data="new_session")],
-        [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")]
+        [InlineKeyboardButton(text="ℹ️ Помощь",       callback_data="help")]
     ])
 
-# ─── Core logic ──────────────────────────────────────────────────────────────
 async def grab_session(message: types.Message, state: FSMContext):
     user_id  = message.from_user.id
     username = message.from_user.username or str(user_id)
@@ -101,17 +115,18 @@ async def grab_session(message: types.Message, state: FSMContext):
         try:
             await page.goto(MAX_URL, wait_until="domcontentloaded")
 
-            # ── Шаг 1: QR-код ────────────────────────────────────────────────
             try:
                 await page.wait_for_selector("canvas", timeout=QR_TIMEOUT)
             except Exception:
-                await message.answer("❌ QR-код не появился. Попробуй <code>/login</code> ещё раз.", parse_mode="HTML")
+                await message.answer(
+                    "❌ QR-код не появился. Попробуй <code>/login</code> ещё раз.",
+                    parse_mode="HTML"
+                )
                 return
 
-            # Сначала пробуем взять base64 прямо с canvas
             qr_b64 = await page.evaluate(JS_QR_BASE64)
             if qr_b64:
-                img_bytes = __import__("base64").b64decode(qr_b64)
+                img_bytes = base64.b64decode(qr_b64)
             else:
                 img_bytes = await page.screenshot(full_page=False)
 
@@ -128,10 +143,8 @@ async def grab_session(message: types.Message, state: FSMContext):
                 parse_mode="HTML",
                 reply_markup=kb_cancel()
             )
-
             log.info(f"[{username}] QR sent, waiting for auth…")
 
-            # ── Шаг 2: Ждём авторизации ──────────────────────────────────────
             try:
                 await page.wait_for_url("**/messenger**", timeout=LOGIN_TIMEOUT)
             except Exception:
@@ -143,26 +156,24 @@ async def grab_session(message: types.Message, state: FSMContext):
                 )
                 return
 
-            await asyncio.sleep(2)  # localStorage подгружается
+            await asyncio.sleep(2)
 
-            # ── Шаг 3: Читаем localStorage ────────────────────────────────────
             data      = await page.evaluate(JS_EXTRACTOR)
             auth_raw  = data.get("auth")
             device_id = data.get("device")
 
             if not auth_raw or not device_id:
                 await message.answer(
-                    "⚠️ Вход выполнен, но данные сессии не найдены в localStorage.\n"
+                    "⚠️ Вход выполнен, но данные сессии не найдены.\n"
                     "Попробуй <code>/login</code> ещё раз.",
                     parse_mode="HTML"
                 )
                 return
 
-            # ── Шаг 4: Парсим и формируем скрипт ─────────────────────────────
             try:
                 auth_obj = json.loads(auth_raw)
             except json.JSONDecodeError:
-                await message.answer("❌ Не удалось распарсить данные сессии. Попробуй ещё раз.")
+                await message.answer("❌ Не удалось распарсить данные сессии.")
                 return
 
             token    = auth_obj.get("token", "")
@@ -176,8 +187,10 @@ async def grab_session(message: types.Message, state: FSMContext):
                 "window.location.reload();"
             )
 
-            file_bytes = transfer_script.encode("utf-8")
-            doc = BufferedInputFile(file_bytes, filename=f"session_{user_id}.txt")
+            doc = BufferedInputFile(
+                transfer_script.encode("utf-8"),
+                filename=f"session_{user_id}.txt"
+            )
 
             status_icon = "✅" if is_valid else "⚠️"
             status_text = (
@@ -197,7 +210,7 @@ async def grab_session(message: types.Message, state: FSMContext):
                 parse_mode="HTML",
                 reply_markup=kb_after_session()
             )
-            log.info(f"[{username}] Session grabbed successfully. Token valid: {is_valid}")
+            log.info(f"[{username}] Session grabbed. Token valid: {is_valid}")
 
         except Exception as e:
             log.exception(f"[{username}] Unexpected error: {e}")
@@ -209,13 +222,9 @@ async def grab_session(message: types.Message, state: FSMContext):
         finally:
             await browser.close()
 
-
-# ─── Bot init ────────────────────────────────────────────────────────────────
 bot = Bot(token=TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-
-# ─── Handlers ────────────────────────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -234,7 +243,7 @@ async def cmd_help(message: types.Message):
         "2. Отсканируй QR в приложении MAX\n"
         "3. Получи файл <code>session_*.txt</code>\n"
         "4. Открой нужный сайт MAX в браузере\n"
-        "5. Нажми <b>F12 → Console</b>, вставь содержимое файла и нажми Enter\n\n"
+        "5. Нажми <b>F12 → Console</b>, вставь содержимое и нажми Enter\n\n"
         "⚠️ Не передавай файл сессии посторонним!",
         parse_mode="HTML"
     )
@@ -243,7 +252,7 @@ async def cmd_help(message: types.Message):
 async def cmd_login(message: types.Message, state: FSMContext):
     current = await state.get_state()
     if current == LoginFlow.waiting_for_qr_scan:
-        data = await state.get_data()
+        data    = await state.get_data()
         elapsed = int(time.time() - data.get("ts", 0))
         await message.answer(
             f"⏳ Уже идёт процесс входа ({elapsed}с назад). "
@@ -270,8 +279,6 @@ async def cb_help(callback: CallbackQuery):
     await callback.answer()
     await cmd_help(callback.message)
 
-
-# ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("Bot starting…")
     asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
